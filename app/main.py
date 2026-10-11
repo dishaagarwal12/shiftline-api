@@ -11,11 +11,11 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 import os
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
-
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
-from pymongo.errors import PyMongoError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 from pymongo import MongoClient
 
 load_dotenv()
@@ -28,7 +28,21 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+def ensure_indexes():
+    db.employees.create_index("emp_code", unique=True)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    ensure_indexes()
+    yield
+
+
+app = FastAPI(
+    title="Employee Attendance & Analytics API",
+    version="2.0.0",
+    lifespan=lifespan,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -93,12 +107,13 @@ def health():
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
     doc["joined_on"] = body.joined_on.isoformat()
     doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
     doc.pop("_id", None)
     return doc
 
