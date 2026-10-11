@@ -9,12 +9,12 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from pymongo.errors import PyMongoError
 from pymongo import MongoClient
 
@@ -54,14 +54,23 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
+TIME_PATTERN = r"^([01]\d|2[0-3]):[0-5]\d$"
+
+
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
-    joined_on: str
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: str = Field(default="09:30", pattern=TIME_PATTERN)
+    shift_end: str = Field(default="18:30", pattern=TIME_PATTERN)
+    joined_on: date
+
+    @model_validator(mode="after")
+    def check_shift_times_differ(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
 
 
 class PunchInIn(BaseModel):
@@ -87,6 +96,7 @@ def create_employee(body: EmployeeIn):
     if db.employees.find_one({"emp_code": body.emp_code}):
         raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
+    doc["joined_on"] = body.joined_on.isoformat()
     doc["created_at"] = datetime.now()
     db.employees.insert_one(doc)
     doc.pop("_id", None)
