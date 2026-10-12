@@ -23,10 +23,30 @@ load_dotenv()
 client = MongoClient(
     os.getenv("MONGO_URI", "mongodb://localhost:27017"),
     serverSelectionTimeoutMS=2000,
+    tz_aware=True,
 )
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
+UTC = timezone.utc
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def now_utc() -> datetime:
+    return datetime.now(UTC)
+
+
+def to_ms(dt: Optional[datetime]) -> Optional[int]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return (dt - EPOCH) // timedelta(milliseconds=1)
+
+def employee_out(doc: dict) -> dict:
+    out = {k: v for k, v in doc.items() if k != "_id"}
+    out["created_at"] = to_ms(doc.get("created_at"))
+    return out
 
 def ensure_indexes():
     db.employees.create_index("emp_code", unique=True)
@@ -109,13 +129,12 @@ def health():
 def create_employee(body: EmployeeIn):
     doc = body.model_dump()
     doc["joined_on"] = body.joined_on.isoformat()
-    doc["created_at"] = datetime.now()
+    doc["created_at"] = now_utc()
     try:
         db.employees.insert_one(doc)
     except DuplicateKeyError:
         raise HTTPException(409, "emp_code already exists")
-    doc.pop("_id", None)
-    return doc
+    return employee_out(doc)
 
 
 @app.get("/employees")
@@ -129,7 +148,7 @@ def list_employees(
         q["department"] = department
     skip = (page - 1) * page_size
     total = db.employees.count_documents(q)
-    items = list(db.employees.find(q, {"_id": 0}).sort("emp_code", 1).skip(skip).limit(page_size))
+    items = [employee_out(d) for d in db.employees.find(q).sort("emp_code", 1).skip(skip).limit(page_size)]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
