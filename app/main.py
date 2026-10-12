@@ -18,6 +18,7 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, model_validator
 from pymongo.errors import DuplicateKeyError, PyMongoError
 from pymongo import MongoClient
+from decimal import ROUND_HALF_UP, Decimal
 
 load_dotenv()
 
@@ -118,6 +119,17 @@ def compute_late_minutes(punch_in: datetime, shift_start_at: datetime) -> int:
     if seconds <= 10 * 60:
         return 0
     return int(seconds // 60)
+
+
+def round_half_up(value, places: int = 2) -> float:
+    step = Decimal(1).scaleb(-places)
+    return float(Decimal(str(value)).quantize(step, rounding=ROUND_HALF_UP))
+
+
+def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
+    seconds = int((punch_out - punch_in).total_seconds())
+    hours = Decimal(seconds) / Decimal(3600)
+    return float(hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 # --------------------------------------------------------------------------- #
