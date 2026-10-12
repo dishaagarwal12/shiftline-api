@@ -132,6 +132,19 @@ def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     return float(hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
+
+def shift_end_at(att_day: date, shift_start: str, shift_end: str) -> datetime:
+    end = at_ist(att_day, shift_end)
+    if shift_end <= shift_start:
+        end = end + timedelta(days=1)
+    return end
+
+
+def compute_overtime(punch_out: datetime, shift_end_at: datetime) -> int:
+    minutes = int((punch_out - shift_end_at).total_seconds() // 60)
+    return minutes if minutes >= 30 else 0
+
+
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
