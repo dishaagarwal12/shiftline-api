@@ -9,7 +9,7 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Annotated, Literal, Optional
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -85,23 +85,24 @@ app = FastAPI(
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    seconds = (punch_in - start).total_seconds()
+def at_ist(day: date, hhmm: str) -> datetime:
+    h, m = map(int, hhmm.split(":"))
+    return datetime(day.year, day.month, day.day, h, m, tzinfo=IST)
+
+
+def attendance_date(local: datetime, shift_start: str, shift_end: str) -> date:
+    day = local.date()
+    end_h, end_m = map(int, shift_end.split(":"))
+    if shift_end <= shift_start and local.time() < time(end_h, end_m):
+        day = day - timedelta(days=1)
+    return day
+
+
+def compute_late_minutes(punch_in: datetime, shift_start_at: datetime) -> int:
+    seconds = (punch_in - shift_start_at).total_seconds()
     if seconds <= 10 * 60:
         return 0
     return int(seconds // 60)
-
-
-def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
-
-
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
 
 
 # --------------------------------------------------------------------------- #
@@ -183,7 +184,8 @@ def punch_in(body: PunchInIn):
     else:
         ts = now_utc().replace(microsecond=0)
     local = ts.astimezone(IST)
-    d = local.date().isoformat()
+    att_day = attendance_date(local, emp["shift_start"], emp["shift_end"])
+    d = att_day.isoformat()
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -191,7 +193,7 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(local, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, at_ist(att_day, emp["shift_start"])),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
