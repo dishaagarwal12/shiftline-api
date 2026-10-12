@@ -43,10 +43,27 @@ def to_ms(dt: Optional[datetime]) -> Optional[int]:
         dt = dt.replace(tzinfo=UTC)
     return (dt - EPOCH) // timedelta(milliseconds=1)
 
+def from_ms(ms: int) -> datetime:
+    return EPOCH + timedelta(milliseconds=ms // 1000 * 1000)
+
 def employee_out(doc: dict) -> dict:
     out = {k: v for k, v in doc.items() if k != "_id"}
     out["created_at"] = to_ms(doc.get("created_at"))
     return out
+
+def record_out(doc: dict) -> dict:
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": to_ms(doc.get("punch_in")),
+        "punch_out": to_ms(doc.get("punch_out")),
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes", 0),
+        "overtime_minutes": doc.get("overtime_minutes", 0),
+        "half_day": doc.get("half_day", False),
+        "history": doc.get("history", []),
+    }
 
 def ensure_indexes():
     db.employees.create_index("emp_code", unique=True)
@@ -113,6 +130,7 @@ class PunchInIn(BaseModel):
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
+
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
@@ -157,8 +175,12 @@ def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
     if emp is None:
         raise HTTPException(404, "employee not found")
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
+    if body.punched_at is not None:
+        ts = from_ms(body.punched_at)
+    else:
+        ts = now_utc().replace(microsecond=0)
+    local = ts.astimezone(IST)
+    d = local.date().isoformat()
     if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
         raise HTTPException(409, "already punched in for this date")
     doc = {
@@ -168,15 +190,13 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(local, emp["shift_start"]),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    db.attendance_logs.insert_one(doc)
+    return record_out(doc)
 
 
 @app.get("/attendance")
