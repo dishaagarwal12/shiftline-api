@@ -88,8 +88,10 @@ app = FastAPI(
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
     h, m = map(int, shift_start.split(":"))
     start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+    seconds = (punch_in - start).total_seconds()
+    if seconds <= 10 * 60:
+        return 0
+    return int(seconds // 60)
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
