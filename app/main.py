@@ -67,7 +67,7 @@ def record_out(doc: dict) -> dict:
 
 def ensure_indexes():
     db.employees.create_index("emp_code", unique=True)
-
+    db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -170,6 +170,7 @@ def list_employees(
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
+
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
@@ -181,8 +182,6 @@ def punch_in(body: PunchInIn):
         ts = now_utc().replace(microsecond=0)
     local = ts.astimezone(IST)
     d = local.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -195,7 +194,10 @@ def punch_in(body: PunchInIn):
         "half_day": False,
         "history": [],
     }
-    db.attendance_logs.insert_one(doc)
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
     return record_out(doc)
 
 
