@@ -52,6 +52,19 @@ def employee_out(doc: dict) -> dict:
     out["created_at"] = to_ms(doc.get("created_at"))
     return out
 
+def history_out(entry: dict) -> dict:
+    changes = {}
+    for field, change in entry.get("changes", {}).items():
+        if field in ("punch_in", "punch_out"):
+            change = {"from": to_ms(change.get("from")), "to": to_ms(change.get("to"))}
+        changes[field] = change
+    return {
+        "at": to_ms(entry.get("at")),
+        "by": entry.get("by"),
+        "reason": entry.get("reason"),
+        "changes": changes,
+    }
+
 def record_out(doc: dict) -> dict:
     return {
         "emp_code": doc["emp_code"],
@@ -63,7 +76,7 @@ def record_out(doc: dict) -> dict:
         "late_minutes": doc.get("late_minutes", 0),
         "overtime_minutes": doc.get("overtime_minutes", 0),
         "half_day": doc.get("half_day", False),
-        "history": doc.get("history", []),
+        "history": [history_out(h) for h in doc.get("history", [])],
     }
 
 def ensure_indexes():
