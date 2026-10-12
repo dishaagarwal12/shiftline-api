@@ -10,7 +10,7 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from datetime import date, datetime, timedelta, timezone
-from typing import Optional
+from typing import Annotated, Literal, Optional
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -106,11 +106,11 @@ class EmployeeIn(BaseModel):
             raise ValueError("shift_start must differ from shift_end")
         return self
 
-
+EpochMs = Annotated[int, Field(strict=True, ge=100_000_000_000, le=4_102_444_800_000)]
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[EpochMs] = None
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
 # --------------------------------------------------------------------------- #
