@@ -14,6 +14,7 @@ from typing import Annotated, Literal, Optional
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, model_validator
 from pymongo.errors import DuplicateKeyError, PyMongoError
 from pymongo import MongoClient
@@ -68,6 +69,7 @@ def record_out(doc: dict) -> dict:
 def ensure_indexes():
     db.employees.create_index("emp_code", unique=True)
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
+    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
 
 @asynccontextmanager
 async def lifespan(app):
@@ -127,6 +129,7 @@ class EmployeeIn(BaseModel):
         return self
 
 EpochMs = Annotated[int, Field(strict=True, ge=100_000_000_000, le=4_102_444_800_000)]
+Status = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
 class PunchInIn(BaseModel):
     emp_code: str
     punched_at: Optional[EpochMs] = None
@@ -208,30 +211,43 @@ def punch_in(body: PunchInIn):
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    status: Optional[Status] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
 ):
+    if date_from and date_to and date_from > date_to:
+        raise RequestValidationError([{
+            "type": "value_error",
+            "loc": ["query", "date_from"],
+            "msg": "date_from must be on or before date_to",
+            "input": date_from.isoformat(),
+        }])
     q = {}
     if emp_code:
         q["emp_code"] = emp_code
     if date_from or date_to:
         q["date"] = {}
         if date_from:
-            q["date"]["$gte"] = date_from
+            q["date"]["$gte"] = date_from.isoformat()
         if date_to:
-            q["date"]["$lte"] = date_to
+            q["date"]["$lte"] = date_to.isoformat()
     if status:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+    total = db.attendance_logs.count_documents(q)
+    cursor = (
+        db.attendance_logs.find(q)
+        .sort([("date", -1), ("emp_code", 1)])
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return {
+        "items": [record_out(d) for d in cursor],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 # --------------------------------------------------------------------------- #
