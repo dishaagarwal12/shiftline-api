@@ -469,6 +469,92 @@ def regularize(emp_code: str, date: date, body: RegularizeIn):
 
 
 # --------------------------------------------------------------------------- #
+# Analytics helpers
+# --------------------------------------------------------------------------- #
+MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
+
+
+def month_days(month: str) -> list:
+    year, mon = map(int, month.split("-"))
+    first = date(year, mon, 1)
+    if mon == 12:
+        next_first = date(year + 1, 1, 1)
+    else:
+        next_first = date(year, mon + 1, 1)
+    return [first + timedelta(days=i) for i in range((next_first - first).days)]
+
+
+def working_days_count(days: list, joined_on: str) -> int:
+    joined = date.fromisoformat(joined_on)
+    return sum(1 for d in days if d.weekday() < 5 and d >= joined)
+
+
+def present_value_expr(weekend_dates: list) -> dict:
+    day_value = {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]}
+    return {
+        "$cond": [
+            {"$in": ["$date", weekend_dates]},
+            0,
+            {"$cond": [{"$in": ["$status", list(PRESENCE)]}, day_value, 0]},
+        ]
+    }
+
+
+def employee_monthly_pipeline(emp_code: str, days: list) -> list:
+    weekend_dates = [d.isoformat() for d in days if d.weekday() >= 5]
+    return [
+        {"$match": {
+            "emp_code": emp_code,
+            "date": {"$gte": days[0].isoformat(), "$lte": days[-1].isoformat()},
+        }},
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": present_value_expr(weekend_dates)},
+            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        }},
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Analytics endpoints
+# --------------------------------------------------------------------------- #
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: str = Query(pattern=MONTH_PATTERN)):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    days = month_days(month)
+    rows = list(db.attendance_logs.aggregate(employee_monthly_pipeline(emp_code, days)))
+    if rows:
+        stats = rows[0]
+    else:
+        stats = {"present_days": 0, "leave_days": 0, "late_count": 0,
+                 "total_late_minutes": 0, "total_overtime_minutes": 0}
+    working_days = working_days_count(days, emp["joined_on"])
+    present = Decimal(str(stats["present_days"]))
+    if working_days > 0:
+        attendance_pct = round_half_up(present * 100 / working_days)
+    else:
+        attendance_pct = None
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": round_half_up(present),
+        "leave_days": stats["leave_days"],
+        "late_count": stats["late_count"],
+        "total_late_minutes": stats["total_late_minutes"],
+        "total_overtime_minutes": stats["total_overtime_minutes"],
+        "attendance_pct": attendance_pct,
+    }
+
+
+
+
+# --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}
