@@ -1,24 +1,21 @@
 """
-Employee Attendance & Analytics API - STARTER
+Employee Attendance & Analytics API
 
 Run:  uvicorn app.main:app --port 8000
-Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
-
-This file was written quickly by a colleague who has left the company. The happy path
-works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
-openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
+Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience; real environment variables win)
 """
 import os
-from datetime import date, datetime, time, timedelta, timezone
-from typing import Annotated, Literal, Optional
 from contextlib import asynccontextmanager
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Annotated, Literal, Optional
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, model_validator
-from pymongo.errors import DuplicateKeyError, PyMongoError
 from pymongo import MongoClient, ReturnDocument
-from decimal import ROUND_HALF_UP, Decimal
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()
 
@@ -34,6 +31,9 @@ UTC = timezone.utc
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
+# --------------------------------------------------------------------------- #
+# Time helpers
+# --------------------------------------------------------------------------- #
 def now_utc() -> datetime:
     return datetime.now(UTC)
 
@@ -45,13 +45,19 @@ def to_ms(dt: Optional[datetime]) -> Optional[int]:
         dt = dt.replace(tzinfo=UTC)
     return (dt - EPOCH) // timedelta(milliseconds=1)
 
+
 def from_ms(ms: int) -> datetime:
     return EPOCH + timedelta(milliseconds=ms // 1000 * 1000)
 
+
+# --------------------------------------------------------------------------- #
+# Output translators (database document -> API shape)
+# --------------------------------------------------------------------------- #
 def employee_out(doc: dict) -> dict:
     out = {k: v for k, v in doc.items() if k != "_id"}
     out["created_at"] = to_ms(doc.get("created_at"))
     return out
+
 
 def history_out(entry: dict) -> dict:
     changes = {}
@@ -65,6 +71,7 @@ def history_out(entry: dict) -> dict:
         "reason": entry.get("reason"),
         "changes": changes,
     }
+
 
 def record_out(doc: dict) -> dict:
     return {
@@ -80,11 +87,16 @@ def record_out(doc: dict) -> dict:
         "history": [history_out(h) for h in doc.get("history", [])],
     }
 
+
+# --------------------------------------------------------------------------- #
+# Startup: indexes
+# --------------------------------------------------------------------------- #
 def ensure_indexes():
     db.employees.create_index("emp_code", unique=True)
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
     db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
     db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
+
 
 @asynccontextmanager
 async def lifespan(app):
@@ -100,7 +112,7 @@ app = FastAPI(
 
 
 # --------------------------------------------------------------------------- #
-# Helpers
+# Business-rule helpers (R1 - R5)
 # --------------------------------------------------------------------------- #
 def at_ist(day: date, hhmm: str) -> datetime:
     h, m = map(int, hhmm.split(":"))
@@ -133,7 +145,6 @@ def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     return float(hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-
 def shift_end_at(att_day: date, shift_start: str, shift_end: str) -> datetime:
     end = at_ist(att_day, shift_end)
     if shift_end <= shift_start:
@@ -146,10 +157,54 @@ def compute_overtime(punch_out: datetime, shift_end_at: datetime) -> int:
     return minutes if minutes >= 30 else 0
 
 
+PRESENCE = ("PRESENT", "WFH", "ON_DUTY")
+
+
+def derived_fields(status: str, punch_in, punch_out, att_day: date, emp: dict) -> dict:
+    if status not in PRESENCE:
+        return {
+            "punch_in": None,
+            "punch_out": None,
+            "work_hours": None,
+            "late_minutes": 0,
+            "overtime_minutes": 0,
+            "half_day": False,
+        }
+    out = {
+        "punch_in": punch_in,
+        "punch_out": punch_out,
+        "work_hours": None,
+        "late_minutes": compute_late_minutes(punch_in, at_ist(att_day, emp["shift_start"])),
+        "overtime_minutes": 0,
+        "half_day": False,
+    }
+    if punch_out is not None:
+        hours = compute_work_hours(punch_in, punch_out)
+        out["work_hours"] = hours
+        out["overtime_minutes"] = compute_overtime(
+            punch_out, shift_end_at(att_day, emp["shift_start"], emp["shift_end"])
+        )
+        out["half_day"] = hours < 4.5
+    return out
+
+
+def invalid(field: Optional[str], msg: str, value):
+    loc = ["body", field] if field else ["body"]
+    return RequestValidationError([{
+        "type": "value_error",
+        "loc": loc,
+        "msg": msg,
+        "input": value,
+    }])
+
+
 # --------------------------------------------------------------------------- #
-# Models
+# Models (request bodies)
 # --------------------------------------------------------------------------- #
 TIME_PATTERN = r"^([01]\d|2[0-3]):[0-5]\d$"
+
+EpochMs = Annotated[int, Field(strict=True, ge=100_000_000_000, le=4_102_444_800_000)]
+Status = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
 
 
 class EmployeeIn(BaseModel):
@@ -167,22 +222,28 @@ class EmployeeIn(BaseModel):
             raise ValueError("shift_start must differ from shift_end")
         return self
 
-EpochMs = Annotated[int, Field(strict=True, ge=100_000_000_000, le=4_102_444_800_000)]
-Status = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
 
 class PunchInIn(BaseModel):
     emp_code: str
     punched_at: Optional[EpochMs] = None
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
+
 class PunchOutIn(BaseModel):
     emp_code: str
     punched_at: Optional[EpochMs] = None
 
 
+class RegularizeIn(BaseModel):
+    status: Optional[Status] = None
+    punch_in: Optional[EpochMs] = None
+    punch_out: Optional[EpochMs] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
 
 # --------------------------------------------------------------------------- #
-# Endpoints provided
+# System and employees
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
@@ -216,11 +277,14 @@ def list_employees(
         q["department"] = department
     skip = (page - 1) * page_size
     total = db.employees.count_documents(q)
-    items = [employee_out(d) for d in db.employees.find(q).sort("emp_code", 1).skip(skip).limit(page_size)]
+    cursor = db.employees.find(q).sort("emp_code", 1).skip(skip).limit(page_size)
+    items = [employee_out(d) for d in cursor]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
-
+# --------------------------------------------------------------------------- #
+# Attendance
+# --------------------------------------------------------------------------- #
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
@@ -232,10 +296,9 @@ def punch_in(body: PunchInIn):
         ts = now_utc().replace(microsecond=0)
     local = ts.astimezone(IST)
     att_day = attendance_date(local, emp["shift_start"], emp["shift_end"])
-    d = att_day.isoformat()
     doc = {
         "emp_code": body.emp_code,
-        "date": d,
+        "date": att_day.isoformat(),
         "status": body.status,
         "punch_in": ts,
         "punch_out": None,
@@ -250,6 +313,45 @@ def punch_in(body: PunchInIn):
     except DuplicateKeyError:
         raise HTTPException(409, "already punched in for this date")
     return record_out(doc)
+
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    if body.punched_at is not None:
+        ts = from_ms(body.punched_at)
+    else:
+        ts = now_utc().replace(microsecond=0)
+
+    rec = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$ne": None, "$lte": ts}},
+        sort=[("punch_in", -1)],
+    )
+    if rec is None:
+        raise HTTPException(404, "no punch-in found")
+    if rec.get("punch_out") is not None:
+        raise HTTPException(409, "already punched out")
+    if ts <= rec["punch_in"] or ts - rec["punch_in"] > timedelta(hours=24):
+        raise invalid("punched_at", "punched_at must be after punch_in and within 24 hours", body.punched_at)
+
+    att_day = date.fromisoformat(rec["date"])
+    work_hours = compute_work_hours(rec["punch_in"], ts)
+    updates = {
+        "punch_out": ts,
+        "work_hours": work_hours,
+        "overtime_minutes": compute_overtime(ts, shift_end_at(att_day, emp["shift_start"], emp["shift_end"])),
+        "half_day": work_hours < 4.5,
+    }
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": rec["_id"], "punch_out": None},
+        {"$set": updates},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "already punched out")
+    return record_out(updated)
 
 
 @app.get("/attendance")
@@ -293,52 +395,79 @@ def list_attendance(
         "page_size": page_size,
     }
 
-def invalid(field: str, msg: str, value):
-    return RequestValidationError([{
-        "type": "value_error",
-        "loc": ["body", field],
-        "msg": msg,
-        "input": value,
-    }])
 
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize(emp_code: str, date: date, body: RegularizeIn):
+    att_day = date  # the date from the URL; renamed so it is not confused with the date type
 
-@app.post("/attendance/punch-out")
-def punch_out(body: PunchOutIn):
-    emp = db.employees.find_one({"emp_code": body.emp_code})
+    # 1. Find the employee and the record
+    emp = db.employees.find_one({"emp_code": emp_code})
     if emp is None:
         raise HTTPException(404, "employee not found")
-    if body.punched_at is not None:
-        ts = from_ms(body.punched_at)
-    else:
-        ts = now_utc().replace(microsecond=0)
-
-    rec = db.attendance_logs.find_one(
-        {"emp_code": body.emp_code, "punch_in": {"$ne": None, "$lte": ts}},
-        sort=[("punch_in", -1)],
-    )
+    rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": att_day.isoformat()})
     if rec is None:
-        raise HTTPException(404, "no punch-in found")
-    if rec.get("punch_out") is not None:
-        raise HTTPException(409, "already punched out")
-    if ts <= rec["punch_in"] or ts - rec["punch_in"] > timedelta(hours=24):
-        raise invalid("punched_at", "punched_at must be after punch_in and within 24 hours", body.punched_at)
+        raise HTTPException(404, "no attendance record for that date")
 
-    att_day = date.fromisoformat(rec["date"])
-    work_hours = compute_work_hours(rec["punch_in"], ts)
-    updates = {
-        "punch_out": ts,
-        "work_hours": work_hours,
-        "overtime_minutes": compute_overtime(ts, shift_end_at(att_day, emp["shift_start"], emp["shift_end"])),
-        "half_day": work_hours < 4.5,
+    # 2. Work out the final status and punch times, and check the rules
+    new_status = body.status or rec["status"]
+    if new_status in PRESENCE:
+        new_in = from_ms(body.punch_in) if body.punch_in is not None else rec.get("punch_in")
+        new_out = from_ms(body.punch_out) if body.punch_out is not None else rec.get("punch_out")
+        if new_in is None:
+            raise invalid("punch_in", "a presence status requires punch_in", None)
+        if body.punch_in is not None:
+            local = new_in.astimezone(IST)
+            if attendance_date(local, emp["shift_start"], emp["shift_end"]) != att_day:
+                raise invalid("punch_in", "punch_in must stay on the record's attendance date", body.punch_in)
+        if new_out is not None and (new_out <= new_in or new_out - new_in > timedelta(hours=24)):
+            raise invalid("punch_out", "punch_out must be after punch_in and within 24 hours", body.punch_out)
+    else:
+        if body.punch_in is not None or body.punch_out is not None:
+            raise invalid("status", "ABSENT and LEAVE cannot have punch times", new_status)
+        new_in = None
+        new_out = None
+
+    # 3. Compare old and new values; keep only what actually changed
+    new_values = {"status": new_status, **derived_fields(new_status, new_in, new_out, att_day, emp)}
+    old_values = {
+        "status": rec["status"],
+        "punch_in": rec.get("punch_in"),
+        "punch_out": rec.get("punch_out"),
+        "work_hours": rec.get("work_hours"),
+        "late_minutes": rec.get("late_minutes", 0),
+        "overtime_minutes": rec.get("overtime_minutes", 0),
+        "half_day": rec.get("half_day", False),
     }
+    changes = {
+        field: {"from": old_values[field], "to": value}
+        for field, value in new_values.items()
+        if old_values[field] != value
+    }
+    if not changes:
+        raise invalid(None, "the request changes nothing", None)
+
+    # 4. Save only if nobody changed the record since we read it, and append history
+    entry = {
+        "at": now_utc(),
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+    guard = {"_id": rec["_id"], "punch_out": rec.get("punch_out")}
+    if "history" in rec:
+        guard["history"] = rec["history"]
+    else:
+        guard["history"] = {"$exists": False}
     updated = db.attendance_logs.find_one_and_update(
-        {"_id": rec["_id"], "punch_out": None},
-        {"$set": updates},
+        guard,
+        {"$set": new_values, "$push": {"history": entry}},
         return_document=ReturnDocument.AFTER,
     )
     if updated is None:
-        raise HTTPException(409, "already punched out")
+        raise HTTPException(409, "record was changed by someone else, please retry")
     return record_out(updated)
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
