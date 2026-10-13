@@ -596,6 +596,70 @@ def late_leaderboard_pipeline(days: list, limit: int, department: Optional[str])
     return pipeline
 
 
+def half_up_expr(value, places: int) -> dict:
+    scale = 10 ** places
+    return {"$divide": [{"$floor": {"$add": [{"$multiply": [value, scale]}, 0.5]}}, scale]}
+
+
+def department_trend_pipeline(start: date, end: date, emp_codes: list, joined_dates: list) -> list:
+    start_s, end_s = start.isoformat(), end.isoformat()
+    lower = datetime(start.year, start.month, start.day, tzinfo=UTC)
+    upper = lower + timedelta(days=(end - start).days + 1)
+    day_value = {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]}
+    presence_value = {"$cond": [{"$in": ["$status", list(PRESENCE)]}, day_value, 0]}
+    rate = {"$divide": [{"$toDecimal": "$present_count"}, "$headcount"]}
+    return [
+        # 1. this department's records in the range (uses the (emp_code, date) index)
+        {"$match": {"emp_code": {"$in": emp_codes}, "date": {"$gte": start_s, "$lte": end_s}}},
+        # 2. make sure at least one row exists, so gap filling works even with no records
+        {"$unionWith": {"pipeline": [{"$documents": [{"date": start_s}]}]}},
+        # 3. one row per day that has records
+        {"$group": {
+            "_id": "$date",
+            "present_count": {"$sum": presence_value},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+        }},
+        # 4. turn the "YYYY-MM-DD" text into a real date, then fill every missing day
+        {"$addFields": {"day": {"$dateFromString": {"dateString": "$_id"}}}},
+        {"$densify": {"field": "day", "range": {"step": 1, "unit": "day", "bounds": [lower, upper]}}},
+        # 5. per-day values
+        {"$addFields": {
+            "date": {"$dateToString": {"date": "$day", "format": "%Y-%m-%d"}},
+            "present_count": {"$ifNull": ["$present_count", 0]},
+            "late_count": {"$ifNull": ["$late_count", 0]},
+            "is_working_day": {"$lte": [{"$isoDayOfWeek": "$day"}, 5]},
+        }},
+        {"$addFields": {
+            "headcount": {"$size": {"$filter": {
+                "input": joined_dates, "as": "joined", "cond": {"$lte": ["$$joined", "$date"]},
+            }}},
+        }},
+        {"$addFields": {
+            "attendance_rate": {"$cond": [
+                {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+                half_up_expr(rate, 4),
+                None,
+            ]},
+        }},
+        # 6. 7-day moving average over the current row and up to 6 rows before it
+        {"$setWindowFields": {
+            "sortBy": {"day": 1},
+            "output": {"moving_avg_7d": {"$avg": "$attendance_rate", "window": {"documents": [-6, 0]}}},
+        }},
+        {"$project": {
+            "_id": 0,
+            "date": 1,
+            "is_working_day": 1,
+            "headcount": 1,
+            "present_count": 1,
+            "late_count": 1,
+            "attendance_rate": {"$toDouble": "$attendance_rate"},
+            "moving_avg_7d": {"$toDouble": half_up_expr("$moving_avg_7d", 4)},
+        }},
+        {"$sort": {"date": 1}},
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # Analytics endpoints
 # --------------------------------------------------------------------------- #
@@ -667,6 +731,33 @@ def late_leaderboard(
     items = list(db.attendance_logs.aggregate(late_leaderboard_pipeline(days, limit, department)))
     return {"month": month, "items": items}
 
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    from_: date = Query(alias="from"),
+    to: date = Query(),
+):
+    if to < from_:
+        raise RequestValidationError([{
+            "type": "value_error", "loc": ["query", "to"],
+            "msg": "to must be on or after from", "input": to.isoformat(),
+        }])
+    if (to - from_).days + 1 > 92:
+        raise RequestValidationError([{
+            "type": "value_error", "loc": ["query", "to"],
+            "msg": "the range must not exceed 92 days", "input": to.isoformat(),
+        }])
+    employees = list(db.employees.find(
+        {"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1}
+    ))
+    if not employees:
+        raise HTTPException(404, "department not found")
+    emp_codes = [e["emp_code"] for e in employees]
+    joined_dates = [e["joined_on"] for e in employees]
+    pipeline = department_trend_pipeline(from_, to, emp_codes, joined_dates)
+    items = list(db.attendance_logs.aggregate(pipeline))
+    return {"department": department, "items": items}
 
 
 # --------------------------------------------------------------------------- #
