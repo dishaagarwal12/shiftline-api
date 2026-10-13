@@ -4,12 +4,14 @@ Employee Attendance & Analytics API
 Run:  uvicorn app.main:app --port 8000
 Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience; real environment variables win)
 """
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
@@ -356,15 +358,11 @@ def punch_out(body: PunchOutIn):
     return record_out(updated)
 
 
-@app.get("/attendance")
-def list_attendance(
-    emp_code: Optional[str] = None,
-    date_from: Optional[date] = None,
-    date_to: Optional[date] = None,
-    status: Optional[Status] = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-):
+ATTENDANCE_SORT = {"date": -1, "emp_code": 1}
+
+
+def attendance_filter(emp_code, date_from, date_to, status) -> dict:
+    """Checks the dates and builds the filter. Used by GET /attendance and by explain."""
     if date_from and date_to and date_from > date_to:
         raise RequestValidationError([{
             "type": "value_error",
@@ -383,10 +381,23 @@ def list_attendance(
             q["date"]["$lte"] = date_to.isoformat()
     if status:
         q["status"] = status
+    return q
+
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    status: Optional[Status] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    q = attendance_filter(emp_code, date_from, date_to, status)
     total = db.attendance_logs.count_documents(q)
     cursor = (
         db.attendance_logs.find(q)
-        .sort([("date", -1), ("emp_code", 1)])
+        .sort(list(ATTENDANCE_SORT.items()))
         .skip((page - 1) * page_size)
         .limit(page_size)
     )
@@ -732,12 +743,7 @@ def late_leaderboard(
     return {"month": month, "items": items}
 
 
-@app.get("/analytics/departments/{department}/trend")
-def department_trend(
-    department: str,
-    from_: date = Query(alias="from"),
-    to: date = Query(),
-):
+def check_trend_range(from_: date, to: date):
     if to < from_:
         raise RequestValidationError([{
             "type": "value_error", "loc": ["query", "to"],
@@ -748,9 +754,22 @@ def department_trend(
             "type": "value_error", "loc": ["query", "to"],
             "msg": "the range must not exceed 92 days", "input": to.isoformat(),
         }])
-    employees = list(db.employees.find(
+
+
+def department_members(department: str) -> list:
+    return list(db.employees.find(
         {"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1}
     ))
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    from_: date = Query(alias="from"),
+    to: date = Query(),
+):
+    check_trend_range(from_, to)
+    employees = department_members(department)
     if not employees:
         raise HTTPException(404, "department not found")
     emp_codes = [e["emp_code"] for e in employees]
@@ -759,6 +778,80 @@ def department_trend(
     items = list(db.attendance_logs.aggregate(pipeline))
     return {"department": department, "items": items}
 
+
+# --------------------------------------------------------------------------- #
+# Admin: explain
+# --------------------------------------------------------------------------- #
+ExplainTarget = Literal[
+    "attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend",
+]
+
+
+def require(params: dict):
+    """422 for every required query parameter that was not sent."""
+    errors = [
+        {"type": "missing", "loc": ["query", name], "msg": "Field required", "input": None}
+        for name, value in params.items()
+        if value is None
+    ]
+    if errors:
+        raise RequestValidationError(errors)
+
+
+def aggregate_command(collection: str, pipeline: list) -> dict:
+    return {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainTarget,
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=MONTH_PATTERN),
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    status: Optional[Status] = None,
+    from_: Optional[date] = Query(None, alias="from"),
+    to: Optional[date] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    # Build the same query the real endpoint builds, using the same helpers
+    if endpoint == "attendance_list":
+        collection = "attendance_logs"
+        command = {
+            "find": collection,
+            "filter": attendance_filter(emp_code, date_from, date_to, status),
+            "sort": ATTENDANCE_SORT,
+            "skip": (page - 1) * page_size,
+            "limit": page_size,
+        }
+    elif endpoint == "employee_monthly":
+        require({"emp_code": emp_code, "month": month})
+        collection = "attendance_logs"
+        command = aggregate_command(collection, employee_monthly_pipeline(emp_code, month_days(month)))
+    elif endpoint == "department_summary":
+        require({"month": month})
+        collection = "employees"
+        command = aggregate_command(collection, department_summary_pipeline(month_days(month), department))
+    elif endpoint == "late_leaderboard":
+        require({"month": month})
+        collection = "attendance_logs"
+        command = aggregate_command(collection, late_leaderboard_pipeline(month_days(month), limit, department))
+    else:  # department_trend
+        require({"department": department, "from": from_, "to": to})
+        check_trend_range(from_, to)
+        employees = department_members(department)
+        emp_codes = [e["emp_code"] for e in employees]
+        joined_dates = [e["joined_on"] for e in employees]
+        collection = "attendance_logs"
+        command = aggregate_command(collection, department_trend_pipeline(from_, to, emp_codes, joined_dates))
+
+    # Ask MongoDB how it would run it (and run it, to get real numbers)
+    raw = db.command({"explain": command, "verbosity": "executionStats"})
+    # Turn MongoDB-only types (dates, timestamps, ObjectIds) into plain JSON
+    return {"endpoint": endpoint, "collection": collection, "explain": json.loads(json_util.dumps(raw))}
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
