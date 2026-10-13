@@ -557,6 +557,45 @@ def department_summary_pipeline(days: list, department: Optional[str]) -> list:
     ]
 
 
+def late_leaderboard_pipeline(days: list, limit: int, department: Optional[str]) -> list:
+    pipeline = [
+        {"$match": {"date": {"$gte": days[0].isoformat(), "$lte": days[-1].isoformat()}}},
+        {"$group": {
+            "_id": "$emp_code",
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+        }},
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        {"$lookup": {
+            "from": "employees",
+            "localField": "_id",
+            "foreignField": "emp_code",
+            "as": "emp",
+        }},
+        {"$unwind": "$emp"},
+    ]
+    if department:
+        pipeline.append({"$match": {"emp.department": department}})
+    pipeline += [
+        {"$setWindowFields": {
+            "sortBy": {"total_late_minutes": -1},
+            "output": {"rank": {"$rank": {}}},
+        }},
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {"$project": {
+            "_id": 0,
+            "rank": 1,
+            "emp_code": "$_id",
+            "name": "$emp.name",
+            "department": "$emp.department",
+            "total_late_minutes": 1,
+            "late_count": 1,
+        }},
+    ]
+    return pipeline
+
+
 # --------------------------------------------------------------------------- #
 # Analytics endpoints
 # --------------------------------------------------------------------------- #
@@ -615,6 +654,17 @@ def department_summary(
             "leave_count": row["leave_count"],
             "on_duty_count": row["on_duty_count"],
         })
+    return {"month": month, "items": items}
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(pattern=MONTH_PATTERN),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    days = month_days(month)
+    items = list(db.attendance_logs.aggregate(late_leaderboard_pipeline(days, limit, department)))
     return {"month": month, "items": items}
 
 
